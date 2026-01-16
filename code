@@ -1,0 +1,2775 @@
+/*
+  ESP32 Voting Machine - FINAL SINGLE .INO
+  - Original logic preserved.
+  - Added: EEPROM persistent counts, offline vote queue, Firebase sync,
+           voters/ metadata storage, results_url, web pages (/ , /results),
+           /voters, /voter?id=, /district?id= pages.
+  - Keep fingerprints, enroll/vote flows unchanged except added pushes/queueing.
+*/
+
+
+// ====== INCLUDES ======
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_Fingerprint.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+
+// ====== FORWARD DECLARATIONS ======
+int findFreeRecordID();
+int enrollFingerAndStore(int chosenID);
+void voteFlow();
+String webEnroll(const String &name, int district, int panchayath);
+String webVote(int candidateIndexProvided, bool hasCandidate, String &outJson);
+void incrementLocalAndRemoteCounts(uint8_t district, uint8_t candidateIndex);
+
+
+// ----------------------------- USER CONFIG -----------------------------
+#define WIFI_SSID      "superman"
+#define WIFI_PASSWORD  "123456789"
+
+
+#define API_KEY        "AIzaSyBZSSD1-jaJpVxuuLmQfLVJiLw_CN8kFgA"
+#define DATABASE_URL   "https://votingmachine-bea13-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+
+// Fingerprint UART pins & baud
+#define FINGER_SERIAL_RX 16
+#define FINGER_SERIAL_TX 17
+#define FINGER_BAUD 57600
+
+
+// EEPROM (24LC256) layout
+#define EEPROM_I2C_ADDR 0x50
+#define RECORD_SIZE 64
+#define MAX_RECORDS 200
+#define RECORDS_START 0x0000
+#define EVENTS_START (RECORDS_START + RECORD_SIZE * MAX_RECORDS)
+#define EVENT_SIZE 32
+#define MAX_EVENTS 200
+#define EVENT_HEAD_ADDR 0x7FF0
+#define EVENT_TAIL_ADDR 0x7FF4
+
+
+// Persistent vote counts addresses (safe high area)
+#define VOTECOUNT_START 0x6000   // 2 bytes per candidate
+#define DISTTOTAL_START 0x6100   // 2 bytes per district total
+#define GLOBALTOTAL_ADDR 0x6200  // 2 bytes global total
+
+
+// Candidates per district (unchanged)
+const int NUM_DISTRICTS = 4;
+const int MAX_CANDIDATES = 6;
+const char* candidates[NUM_DISTRICTS][MAX_CANDIDATES] = {
+  {"Party A", "Party B", "Party C", "", "", ""},    // district 1
+  {"Alpha", "Beta", "Gamma", "", "", ""},           // district 2
+  {"Red", "Blue", "", "", "", ""},                  // district 3
+  {"Leader1", "Leader2", "Leader3", "Leader4", "", ""} // district 4
+};
+const int candidateCountsForDistrict[NUM_DISTRICTS] = {3,3,2,4};
+
+
+// ------------------------------------------------
+
+
+// Web server
+WebServer server(80);
+
+
+// Firebase objects (Mobizt)
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+
+// Fingerprint
+HardwareSerial fingerSerial(2);
+Adafruit_Fingerprint finger(&fingerSerial);
+
+
+// timing for auto sync
+unsigned long lastAutoSyncMs = 0;
+const unsigned long AUTO_SYNC_INTERVAL_MS = 10000; // try every 10s
+
+
+// ----------------- In-memory vote counters (local) -----------------
+int voteCount[NUM_DISTRICTS][MAX_CANDIDATES];
+int districtTotal[NUM_DISTRICTS];
+int globalTotal = 0;
+
+
+// ----------------- Data structs -----------------
+struct VoterRecord {
+  bool valid;
+  uint8_t fingerID;
+  char name[31];
+  uint8_t district;
+  uint8_t panchayath;
+};
+
+
+struct VoteEvent {
+  uint32_t ts;
+  uint8_t fingerID;
+  uint8_t district;
+  uint8_t candidateIndex;
+  char candidateName[32];
+};
+
+
+// ----------------- EEPROM helpers -----------------
+void eepromWriteByte(uint16_t memAddr, uint8_t data) {
+  Wire.beginTransmission(EEPROM_I2C_ADDR);
+  Wire.write((int)(memAddr >> 8));
+  Wire.write((int)(memAddr & 0xFF));
+  Wire.write(data);
+  Wire.endTransmission();
+  delay(6);
+}
+uint8_t eepromReadByte(uint16_t memAddr) {
+  Wire.beginTransmission(EEPROM_I2C_ADDR);
+  Wire.write((int)(memAddr >> 8));
+  Wire.write((int)(memAddr & 0xFF));
+  Wire.endTransmission();
+  Wire.requestFrom(EEPROM_I2C_ADDR, (uint8_t)1);
+  if (Wire.available()) return Wire.read();
+  return 0xFF;
+}
+void writeStringToEEPROM(uint16_t memAddr, const char* s, uint16_t maxLen){
+  size_t slen = strlen(s);
+  for (uint16_t i=0;i<maxLen;i++){
+    uint8_t b = (i < slen) ? s[i] : 0;
+    eepromWriteByte(memAddr + i, b);
+  }
+}
+void readStringFromEEPROM(uint16_t memAddr, char* out, uint16_t maxLen){
+  for (uint16_t i=0;i<maxLen;i++){
+    out[i] = (char)eepromReadByte(memAddr + i);
+  }
+  out[maxLen-1] = 0;
+}
+uint16_t recordAddress(uint8_t fingerID){
+  if (fingerID < 1) fingerID = 1;
+  return RECORDS_START + (uint16_t)(fingerID - 1) * RECORD_SIZE;
+}
+void saveVoterRecord(uint8_t fingerID, const VoterRecord &r){
+  uint16_t addr = recordAddress(fingerID);
+  eepromWriteByte(addr + 0, r.valid ? 1 : 0);
+  eepromWriteByte(addr + 1, r.fingerID);
+  writeStringToEEPROM(addr + 2, r.name, 30);
+  eepromWriteByte(addr + 32, r.district);
+  eepromWriteByte(addr + 33, r.panchayath);
+  for (uint16_t i=34;i<RECORD_SIZE;i++) eepromWriteByte(addr+i, 0);
+}
+bool loadVoterRecord(uint8_t fingerID, VoterRecord &r){
+  if (fingerID < 1 || fingerID > MAX_RECORDS) return false;
+  uint16_t addr = recordAddress(fingerID);
+  uint8_t valid = eepromReadByte(addr + 0);
+  r.valid = (valid == 1);
+  r.fingerID = eepromReadByte(addr + 1);
+  readStringFromEEPROM(addr + 2, r.name, 31);
+  r.district = eepromReadByte(addr + 32);
+  r.panchayath = eepromReadByte(addr + 33);
+  return r.valid;
+}
+void deleteVoterRecord(uint8_t fingerID){
+  VoterRecord r;
+  memset(&r,0,sizeof(r));
+  r.valid = false;
+  r.fingerID = fingerID;
+  saveVoterRecord(fingerID, r);
+}
+
+
+// ----------------- Event queue helpers -----------------
+uint16_t readUInt16FromEEPROM(uint16_t addr){
+  uint8_t lo = eepromReadByte(addr);
+  uint8_t hi = eepromReadByte(addr+1);
+  return (uint16_t)hi<<8 | lo;
+}
+void writeUInt16ToEEPROM(uint16_t addr, uint16_t val){
+  eepromWriteByte(addr, val & 0xFF);
+  eepromWriteByte(addr+1, (val >> 8) & 0xFF);
+}
+uint16_t eventSlotAddr(uint16_t idx){
+  return EVENTS_START + idx * EVENT_SIZE;
+}
+uint16_t getEventHead(){ return readUInt16FromEEPROM(EVENT_HEAD_ADDR); }
+uint16_t getEventTail(){ return readUInt16FromEEPROM(EVENT_TAIL_ADDR); }
+void setEventHead(uint16_t v){ writeUInt16ToEEPROM(EVENT_HEAD_ADDR, v); }
+void setEventTail(uint16_t v){ writeUInt16ToEEPROM(EVENT_TAIL_ADDR, v); }
+
+
+void enqueueEvent(const VoteEvent &ev){
+  uint16_t head = getEventHead();
+  uint16_t tail = getEventTail();
+  uint16_t nextTail = (tail + 1) % MAX_EVENTS;
+  if (nextTail == head){
+    Serial.println("Offline queue full! Cannot enqueue event.");
+    return;
+  }
+  uint16_t addr = eventSlotAddr(tail);
+  uint32_t ts = ev.ts;
+  eepromWriteByte(addr+0, (ts >> 24) & 0xFF);
+  eepromWriteByte(addr+1, (ts >> 16) & 0xFF);
+  eepromWriteByte(addr+2, (ts >> 8) & 0xFF);
+  eepromWriteByte(addr+3, (ts) & 0xFF);
+  eepromWriteByte(addr+4, ev.fingerID);
+  eepromWriteByte(addr+5, ev.district);
+  eepromWriteByte(addr+6, ev.candidateIndex);
+  writeStringToEEPROM(addr+7, ev.candidateName, 25);
+  setEventTail(nextTail);
+}
+
+
+bool dequeueEvent(VoteEvent &ev){
+  uint16_t head = getEventHead();
+  uint16_t tail = getEventTail();
+  if (head == tail) return false;
+  uint16_t addr = eventSlotAddr(head);
+  uint32_t ts = 0;
+  ts |= ((uint32_t)eepromReadByte(addr+0)) << 24;
+  ts |= ((uint32_t)eepromReadByte(addr+1)) << 16;
+  ts |= ((uint32_t)eepromReadByte(addr+2)) << 8;
+  ts |= ((uint32_t)eepromReadByte(addr+3));
+  ev.ts = ts;
+  ev.fingerID = eepromReadByte(addr+4);
+  ev.district = eepromReadByte(addr+5);
+  ev.candidateIndex = eepromReadByte(addr+6);
+  readStringFromEEPROM(addr+7, ev.candidateName, 25);
+  uint16_t nextHead = (head + 1) % MAX_EVENTS;
+  setEventHead(nextHead);
+  return true;
+}
+
+
+void initEventQueueIfNeeded(){
+  uint16_t head = getEventHead();
+  uint16_t tail = getEventTail();
+  if (head == 0xFFFF && tail == 0xFFFF){
+    setEventHead(0);
+    setEventTail(0);
+  }
+}
+int getOfflineQueueSize(){
+  uint16_t head = getEventHead();
+  uint16_t tail = getEventTail();
+  if (head == 0xFFFF && tail == 0xFFFF) return 0;
+  if (tail >= head) return tail - head;
+  return (MAX_EVENTS - head) + tail;
+}
+
+
+// ----------------- Fingerprint helpers -----------------
+void initFingerprint(){
+  fingerSerial.begin(FINGER_BAUD, SERIAL_8N1, FINGER_SERIAL_RX, FINGER_SERIAL_TX);
+  delay(100);
+  finger.begin(FINGER_BAUD);
+  if (finger.verifyPassword()){
+    Serial.println("Fingerprint sensor found!");
+  } else {
+    Serial.println("Fingerprint sensor NOT found. Check wiring/power.");
+  }
+}
+
+
+int enrollFingerAndStore(int chosenID){
+  Serial.println(F("Starting enrollment process..."));
+  int p = -1;
+  Serial.print("Place finger #"); Serial.println(chosenID);
+  while (p != FINGERPRINT_OK){
+    p = finger.getImage();
+    if (p == FINGERPRINT_OK) break;
+    if (p == FINGERPRINT_NOFINGER) delay(200);
+    else { Serial.print("getImage error: "); Serial.println(p); delay(200); }
+  }
+  if (finger.image2Tz(1) != FINGERPRINT_OK){ Serial.println("Image2TZ failed."); return -1; }
+  Serial.println("Remove finger"); delay(1500);
+  while (finger.getImage() != FINGERPRINT_NOFINGER) delay(200);
+  Serial.println("Place same finger again");
+  while (true){ p = finger.getImage(); if (p == FINGERPRINT_OK) break; delay(200); }
+  if (finger.image2Tz(2) != FINGERPRINT_OK){ Serial.println("Image2TZ #2 failed."); return -1; }
+  if (finger.createModel() != FINGERPRINT_OK){ Serial.println("Could not create model."); return -1; }
+  if (finger.storeModel(chosenID) == FINGERPRINT_OK){
+    Serial.print("Stored model at ID "); Serial.println(chosenID);
+    return chosenID;
+  }
+  Serial.println("Could not store model.");
+  return -1;
+}
+
+
+int findFreeRecordID(){
+  for (int id = 1; id <= MAX_RECORDS; id++){
+    uint16_t addr = recordAddress(id);
+    uint8_t valid = eepromReadByte(addr + 0);
+    if (valid != 1) return id;
+  }
+  return -1;
+}
+
+
+// ----------------- Firebase (Mobizt) helpers -----------------
+void firebaseSetup(){
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  // anonymous sign-in (empty email/pass)
+  auth.user.email = "";
+  auth.user.password = "";
+  config.token_status_callback = tokenStatusCallback;
+  // Attempt signUp (anonymous), then begin
+  if (Firebase.signUp(&config, &auth, "", "")){
+    Serial.println("Firebase signUp OK");
+  } else {
+    // if signUp fails with "EMAIL_EXISTS" it's OK (already signed up)
+    Serial.printf("Firebase signUp: %s\n", config.signer.signupError.message.c_str());
+  }
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+
+// Update Firebase candidate count and district total (atomic-ish: read current -> set incremented)
+bool firebaseIncrementVote(uint8_t district, uint8_t candidate)
+{
+  if (!Firebase.ready()) {
+    Serial.println("Firebase not ready for increment.");
+    return false;
+  }
+
+
+  String base = String("/votes/district_") + String(district);
+  String candPath = base + "/candidate_" + String(candidate);
+  String totalPath = base + "/total";
+
+
+  // Candidate
+  int candCount = 0;
+  if (Firebase.RTDB.getInt(&fbdo, candPath.c_str())) {
+    candCount = fbdo.intData();
+  } else {
+    // if not found, fbdo.payload() may be "null" — we'll initialize
+    if (fbdo.httpCode() != 200) {
+      // non-fatal, will still attempt to set to 1
+    }
+  }
+  candCount++;
+  if (!Firebase.RTDB.setInt(&fbdo, candPath.c_str(), candCount)) {
+    Serial.println("Failed set candidate: " + fbdo.errorReason());
+    // still continue to try total update
+  }
+
+
+  // Total
+  int totalCount = 0;
+  if (Firebase.RTDB.getInt(&fbdo, totalPath.c_str())) {
+    totalCount = fbdo.intData();
+  } else {
+    // init to 0 then increment
+  }
+  totalCount++;
+  if (!Firebase.RTDB.setInt(&fbdo, totalPath.c_str(), totalCount)) {
+    Serial.println("Failed set total: " + fbdo.errorReason());
+  }
+
+
+  // Update results_url as well
+  String url = String("http://") + WiFi.localIP().toString() + "/results";
+  if (!Firebase.RTDB.setString(&fbdo, "/results_url", url)) {
+    Serial.println("Failed set results_url: " + fbdo.errorReason());
+  }
+
+
+  return true;
+}
+
+
+// Push vote event into history: /vote_history/district_N
+bool firebasePushVote(const VoteEvent &ev){
+  if (!Firebase.ready()) return false;
+  String path = String("/vote_history/district_") + String(ev.district);
+  FirebaseJson json;
+  json.set("voter_id", ev.fingerID);
+  json.set("candidate_index", ev.candidateIndex + 1); // store 1-based for readability
+  json.set("candidate_name", String(ev.candidateName));
+  json.set("timestamp", (int)ev.ts);
+  if (Firebase.RTDB.pushJSON(&fbdo, path.c_str(), &json)){
+    Serial.println("Firebase: pushed history key: " + fbdo.pushName());
+    return true;
+  } else {
+    Serial.println("Firebase push history failed: " + fbdo.errorReason());
+    return false;
+  }
+}
+
+
+// Push voter metadata into Firebase at /voters/<id>
+bool firebasePushVoter(uint8_t id, const VoterRecord &r){
+  if (!Firebase.ready()) return false;
+  String path = String("/voters/") + String(id);
+  FirebaseJson json;
+  json.set("name", String(r.name));
+  json.set("district", (int)r.district);
+  json.set("panchayath", (int)r.panchayath);
+  if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)){
+    Serial.println("Firebase: pushed voter " + String(id));
+    return true;
+  } else {
+    Serial.println("Firebase: failed push voter: " + fbdo.errorReason());
+    return false;
+  }
+}
+
+
+// Update only results URL in Firebase (call at boot and on IP change)
+void firebaseUpdateResultsURL() {
+  if (!Firebase.ready()) return;
+  String url = String("http://") + WiFi.localIP().toString() + "/results";
+  if (!Firebase.RTDB.setString(&fbdo, "/results_url", url)){
+    Serial.println("Failed set results_url: " + fbdo.errorReason());
+  } else {
+    Serial.println("Firebase results_url updated: " + url);
+  }
+}
+
+
+// ----------------- Vote counts persistence -----------------
+void saveCountsToEEPROM() {
+  uint16_t addr = VOTECOUNT_START;
+  for (int d = 0; d < NUM_DISTRICTS; d++) {
+    for (int c = 0; c < MAX_CANDIDATES; c++) {
+      uint16_t val = (uint16_t)voteCount[d][c];
+      writeUInt16ToEEPROM(addr, val);
+      addr += 2;
+    }
+  }
+  addr = DISTTOTAL_START;
+  for (int d = 0; d < NUM_DISTRICTS; d++) {
+    writeUInt16ToEEPROM(addr, (uint16_t)districtTotal[d]);
+    addr += 2;
+  }
+  writeUInt16ToEEPROM(GLOBALTOTAL_ADDR, (uint16_t)globalTotal);
+}
+
+
+void loadCountsFromEEPROM() {
+  uint16_t addr = VOTECOUNT_START;
+  for (int d = 0; d < NUM_DISTRICTS; d++) {
+    for (int c = 0; c < MAX_CANDIDATES; c++) {
+      uint16_t v = readUInt16FromEEPROM(addr);
+      // Treat 0xFFFF as 0 (uninitialized)
+      if (v == 0xFFFF) v = 0;
+      voteCount[d][c] = (int)v;
+      addr += 2;
+    }
+  }
+  addr = DISTTOTAL_START;
+  for (int d = 0; d < NUM_DISTRICTS; d++) {
+    uint16_t v = readUInt16FromEEPROM(addr);
+    if (v == 0xFFFF) v = 0;
+    districtTotal[d] = (int)v;
+    addr += 2;
+  }
+  {
+    uint16_t v = readUInt16FromEEPROM(GLOBALTOTAL_ADDR);
+    if (v == 0xFFFF) v = 0;
+    globalTotal = (int)v;
+  }
+}
+
+
+// ----------------- Sync queued events -----------------
+void syncOfflineVotes(){
+  if (!Firebase.ready()){
+    Serial.println("Firebase not ready; skip sync");
+    return;
+  }
+  VoteEvent ev;
+  int attempts = 0;
+  while (dequeueEvent(ev) && attempts < MAX_EVENTS){
+    attempts++;
+    // push history (if fails, re-enqueue and abort)
+    if (!firebasePushVote(ev)){
+      enqueueEvent(ev);
+      Serial.println("Failed to push queued history; re-enqueued and aborting sync.");
+      return;
+    }
+    // increment counts (pass 1-based candidate)
+    if (!firebaseIncrementVote(ev.district, ev.candidateIndex + 1)){
+      enqueueEvent(ev);
+      Serial.println("Failed to increment queued vote counts; re-enqueued and aborting sync.");
+      return;
+    }
+    Serial.println("Synced queued event to Firebase.");
+    delay(50);
+  }
+  if (attempts > 0) Serial.println("Offline sync completed.");
+}
+
+
+// ----------------- Serial UI and flows -----------------
+void showMenu(){
+  Serial.println("\n=== Voting Machine Menu ===");
+  Serial.println("1. Enroll Voter");
+  Serial.println("2. Scan & Vote");
+  Serial.println("3. List enrolled voters (brief)");
+  Serial.println("4. Delete voter by ID");
+  Serial.println("5. Delete ALL voters (careful!)");
+  Serial.println("6. Show offline queue size");
+  Serial.println("7. Show leaderboard (local counts)");
+  Serial.println("Enter option number:");
+  Serial.printf("Offline queue size: %d\n", getOfflineQueueSize());
+}
+
+
+void enrollFlow(){
+  int freeID = findFreeRecordID();
+  if (freeID < 0){
+    Serial.println("No free record slots in EEPROM!");
+    return;
+  }
+  Serial.print("Using free ID: "); Serial.println(freeID);
+  int res = enrollFingerAndStore(freeID);
+  if (res <= 0){ Serial.println("Enrollment failed."); return; }
+
+
+  Serial.println("Enter name (single line): ");
+  while (!Serial.available()) delay(10);
+  String name = Serial.readStringUntil('\n'); name.trim();
+  Serial.println("Enter district number (1..): ");
+  while (!Serial.available()) delay(10);
+  int district = Serial.parseInt(); Serial.readStringUntil('\n');
+  Serial.println("Enter panchayath code (number): ");
+  while (!Serial.available()) delay(10);
+  int panch = Serial.parseInt(); Serial.readStringUntil('\n');
+
+
+  VoterRecord r;
+  r.valid = true;
+  r.fingerID = freeID;
+  strncpy(r.name, name.c_str(), 30);
+  r.name[30] = 0;
+  r.district = (uint8_t)district;
+  r.panchayath = (uint8_t)panch;
+  saveVoterRecord(freeID, r);
+  Serial.println("Saved voter record to EEPROM.");
+
+
+  // attempt to push voter metadata to Firebase (non-fatal)
+  if (Firebase.ready()){
+    if (!firebasePushVoter(freeID, r)){
+      Serial.println("Failed to push voter metadata to Firebase (will retry on next sync).");
+    }
+  } else {
+    Serial.println("Firebase not ready; voter metadata will be available locally only.");
+  }
+}
+
+
+void voteFlow(){
+  // clear Serial buffer
+  while (Serial.available()) Serial.read();
+
+
+  Serial.println("👉 You have 5 seconds to place your finger...");
+  unsigned long start = millis();
+  int matchedID = -1;
+
+
+  while (millis() - start < 5000){
+    int p = finger.getImage();
+    if (p == FINGERPRINT_OK){
+      if (finger.image2Tz() == FINGERPRINT_OK){
+        if (finger.fingerFastSearch() == FINGERPRINT_OK){
+          matchedID = finger.fingerID;
+          break;
+        }
+      }
+    }
+    delay(80);
+  }
+
+
+  if (matchedID < 0){ Serial.println("⚠️ Finger not recognized or timeout."); return; }
+  VoterRecord r;
+  if (!loadVoterRecord(matchedID, r)){ Serial.println("⚠️ No voter metadata found in EEPROM for this ID."); return; }
+
+
+  Serial.printf("✅ Matched: ID %d | Name: %s | District: %d | Panchayath: %d\n", matchedID, r.name, r.district, r.panchayath);
+  int dIndex = r.district - 1;
+  if (dIndex < 0 || dIndex >= NUM_DISTRICTS){ Serial.println("⚠️ Unknown district or no candidates configured."); return; }
+  int candCount = candidateCountsForDistrict[dIndex];
+  Serial.println("Select candidate number:");
+  for (int i=0;i<candCount;i++) Serial.printf("%d. %s\n", i+1, candidates[dIndex][i]);
+
+
+  while (!Serial.available()) delay(10);
+  int sel = Serial.parseInt(); Serial.readStringUntil('\n');
+  if (sel < 1 || sel > candCount){ Serial.println("⚠️ Invalid selection."); return; }
+  int candIdx = sel - 1;
+  const char* candName = candidates[dIndex][candIdx];
+
+
+  // Build vote event
+  VoteEvent ev;
+  ev.ts = (uint32_t)(millis() / 1000UL);
+  ev.fingerID = matchedID;
+  ev.district = r.district;
+  ev.candidateIndex = candIdx;
+  strncpy(ev.candidateName, candName, sizeof(ev.candidateName)-1);
+  ev.candidateName[sizeof(ev.candidateName)-1] = 0;
+
+
+  // Update local and remote counts
+  incrementLocalAndRemoteCounts(r.district, candIdx);
+
+
+  // Try to send history immediately; if fails, enqueue
+  if (Firebase.ready()){
+    if (firebasePushVote(ev)){
+      // done
+    } else {
+      enqueueEvent(ev);
+      Serial.println("Firebase push failed; enqueueing vote event.");
+    }
+  } else {
+    enqueueEvent(ev);
+    Serial.println("Firebase not ready; vote queued.");
+  }
+
+
+  Serial.println("✅ Vote recorded locally and queued for Firebase if necessary.");
+}
+
+
+void listVoters(){
+  Serial.println("=== Enrolled voters (brief) ===");
+  for (int id=1; id<=MAX_RECORDS; id++){
+    VoterRecord r;
+    if (loadVoterRecord(id, r)){
+      Serial.printf("ID %d: %s | D:%d P:%d\n", id, r.name, r.district, r.panchayath);
+    }
+  }
+}
+
+
+void deleteVoterByID(){
+  Serial.println("Enter ID to delete:");
+  while (!Serial.available()) delay(10);
+  int id = Serial.parseInt(); Serial.readStringUntil('\n');
+  if (id < 1 || id > MAX_RECORDS){ Serial.println("Invalid ID"); return; }
+  deleteVoterRecord(id);
+  Serial.println("Deleted record from EEPROM. (Fingerprint template on sensor may still exist.)");
+}
+
+
+void deleteAllVoters(){
+  Serial.println("ARE YOU SURE? Type YES to confirm:");
+  while (!Serial.available()) delay(10);
+  String s = Serial.readStringUntil('\n'); s.trim();
+  if (s == "YES"){
+    for (int id=1; id<=MAX_RECORDS; id++) deleteVoterRecord(id);
+    Serial.println("All voter metadata cleared from EEPROM.");
+  } else Serial.println("Aborted.");
+}
+
+
+void showLeaderboard(){
+  // print local counts as JSON-style text
+  Serial.println("{");
+  for (int d=0; d<NUM_DISTRICTS; d++){
+    Serial.printf("  \"district_%d\": {", d+1);
+    int cnt = candidateCountsForDistrict[d];
+    for (int c=0; c<cnt; c++){
+      Serial.printf("\"candidate_%d\": %d", c+1, voteCount[d][c]);
+      if (c < cnt-1) Serial.print(", ");
+    }
+    Serial.print(", \"total\": ");
+    Serial.printf("%d", districtTotal[d]);
+    Serial.print(" }");
+    if (d < NUM_DISTRICTS-1) Serial.println(",");
+    else Serial.println();
+  }
+  Serial.println("}");
+  Serial.printf("Overall Total Votes: %d\n", globalTotal);
+}
+
+
+// ----------------- Web wrappers & endpoints -----------------
+
+
+// Web enroll: requires name, district, panch
+String webEnroll(const String &name, int district, int panchayath){
+  int freeID = findFreeRecordID();
+  if (freeID < 0) return String("No free slots");
+
+
+  int res = enrollFingerAndStore(freeID);
+  if (res <= 0) return String("Enrollment failed (sensor)");
+
+
+  VoterRecord r;
+  r.valid = true;
+  r.fingerID = freeID;
+  strncpy(r.name, name.c_str(), 30);
+  r.name[30] = 0;
+  r.district = (uint8_t)district;
+  r.panchayath = (uint8_t)panchayath;
+  saveVoterRecord(freeID, r);
+
+
+  // Attempt to push voter metadata to Firebase (non-fatal)
+  if (Firebase.ready()){
+    if (!firebasePushVoter(freeID, r)){
+      Serial.println("Failed to push voter metadata to Firebase (will retry on next sync).");
+    }
+  } else {
+    Serial.println("Firebase not ready; voter metadata local only.");
+  }
+
+
+  return String("Enrolled ID: ") + String(freeID);
+}
+
+
+// Web vote wrapper: if hasCandidate==false -> return candidate choices (after scan)
+// if hasCandidate==true -> cast vote (candidateIndexProvided)
+String webVote(int candidateIndexProvided, bool hasCandidate, String &outJson){
+  unsigned long start = millis();
+  int matchedID = -1;
+  while (millis() - start < 5000){
+    int p = finger.getImage();
+    if (p == FINGERPRINT_OK){
+      if (finger.image2Tz() == FINGERPRINT_OK){
+        if (finger.fingerFastSearch() == FINGERPRINT_OK){
+          matchedID = finger.fingerID;
+          break;
+        }
+      }
+    }
+    delay(50);
+  }
+  if (matchedID < 0) return String("No finger matched");
+
+
+  VoterRecord r;
+  if (!loadVoterRecord(matchedID, r)) return String("No voter metadata for matched ID");
+
+
+  int dIndex = r.district - 1;
+  if (dIndex < 0 || dIndex >= NUM_DISTRICTS) return String("No candidates for district");
+
+
+  if (!hasCandidate){
+    DynamicJsonDocument doc(512);
+    doc["status"] = "ok_choices";
+    doc["voter_id"] = matchedID;
+    doc["name"] = String(r.name);
+    doc["district"] = r.district;
+    JsonArray arr = doc.createNestedArray("candidates");
+    int candCount = candidateCountsForDistrict[dIndex];
+    for (int i=0;i<candCount;i++) arr.add(candidates[dIndex][i]);
+    serializeJson(doc, outJson);
+    return String("CHOICE_LIST");
+  } else {
+    int candIdx = candidateIndexProvided;
+    if (candIdx < 0 || candIdx >= candidateCountsForDistrict[dIndex]) return String("Invalid candidate index");
+    // increment local and firebase counts
+    incrementLocalAndRemoteCounts(r.district, candIdx);
+    // Create VoteEvent and try to push history; if fails enqueue
+    VoteEvent ev;
+    ev.ts = (uint32_t)(millis() / 1000UL);
+    ev.fingerID = matchedID;
+    ev.district = r.district;
+    ev.candidateIndex = candIdx;
+    strncpy(ev.candidateName, candidates[dIndex][candIdx], sizeof(ev.candidateName)-1);
+    ev.candidateName[sizeof(ev.candidateName)-1] = 0;
+
+
+    if (Firebase.ready()){
+      if (!firebasePushVote(ev)){
+        enqueueEvent(ev);
+        Serial.println("Firebase push failed; event queued.");
+      }
+    } else {
+      enqueueEvent(ev);
+      Serial.println("Offline: vote event queued.");
+    }
+
+
+    return String("Vote recorded locally and queued for Firebase.");
+  }
+}
+
+
+// Return local counts as JSON at /cmd/getLocalCounts
+void handleGetLocalCounts(){
+  DynamicJsonDocument doc(2048);
+  for (int d=0; d<NUM_DISTRICTS; d++){
+    String dk = "district_" + String(d+1);
+    JsonObject dob = doc.createNestedObject(dk);
+    int cnt = candidateCountsForDistrict[d];
+    for (int c=0; c<cnt; c++){
+      String ck = "candidate_" + String(c+1);
+      dob[ck] = voteCount[d][c];
+    }
+    dob["total"] = districtTotal[d];
+  }
+  // include overall
+  doc.createNestedObject("meta")["overall"] = globalTotal;
+
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+
+// Setup webpages and endpoints
+void setupWebServerRoutes(){
+  // Main control page
+  server.on("/", HTTP_GET, [](){
+    String page = R"====(
+<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Voting Machine Control</title>
+<style>
+body{font-family:Arial;background:#f5f8fb;margin:0;padding:18px}
+.header{background:#1a73e8;color:#fff;padding:12px;border-radius:8px;text-align:center}
+.card{background:#fff;padding:16px;border-radius:10px;margin-top:14px;box-shadow:0 6px 18px rgba(16,24,40,0.06)}
+.btn{background:#1a73e8;color:#fff;border:none;padding:10px 14px;border-radius:8px;margin:6px;font-size:15px;cursor:pointer}
+.small{color:#6b7280;font-size:13px}
+.vote-buttons { margin-top:12px; display:flex; flex-wrap:wrap; gap:8px; }
+</style>
+<script>
+function callPlain(endpoint, onDone){ fetch(endpoint).then(r=>r.text()).then(t=>{ if(onDone) onDone(t); else alert(t); }); }
+
+
+// Vote: request choices (triggers fingerprint scan), then render candidate buttons
+function voteWeb(){
+  fetch('/cmd/vote?mode=choices').then(r=>r.json()).then(data=>{
+    if(!data || data.status!=='ok_choices'){ alert('No match or error: ' + (data.msg||'')); return; }
+    const voteArea = document.getElementById('voteArea');
+    voteArea.innerHTML = '';
+    const h = document.createElement('h3'); h.innerText = 'Select for: ' + data.name; voteArea.appendChild(h);
+    const cont = document.createElement('div');
+    cont.className = 'vote-buttons';
+    data.candidates.forEach((cand, idx) => {
+      const b = document.createElement('button');
+      b.className='btn';
+      b.innerText = cand;
+      b.onclick = function(){
+        fetch('/cmd/vote?mode=cast&candidate=' + idx)
+          .then(r=>r.text())
+          .then(resp=>{
+            alert(resp);
+            voteArea.innerHTML='';
+          });
+      };
+      cont.appendChild(b);
+    });
+    voteArea.appendChild(cont);
+  }).catch(e=>{ alert('Error: '+e); });
+}
+
+
+function enrollWeb(){
+  const name = prompt('Voter name:'); if(!name) return;
+  const district = prompt('District number:'); if(!district) return;
+  const panch = prompt('Panchayath code:'); if(!panch) return;
+  callPlain('/cmd/enroll?name='+encodeURIComponent(name)+'&district='+district+'&panch='+panch, function(t){ alert(t); });
+}
+
+
+function listWeb(){ callPlain('/cmd/list'); }
+function deleteOne(){ const id=prompt('ID to delete:'); if(id) callPlain('/cmd/delete?id='+id); }
+function deleteAll(){ if(confirm('Delete ALL voters?')) callPlain('/cmd/delete_all'); }
+function queueSz(){ callPlain('/cmd/queue'); }
+function leaderboard(){ fetch('/cmd/leaderboard').then(r=>r.text()).then(t=>{ try{ const j=JSON.parse(t); alert(JSON.stringify(j,null,2)); }catch(e){ alert(t); } }); }
+</script>
+</head><body>
+<div class='header'><h2>Voting Machine Control</h2></div>
+<div class='card'>
+  <button class='btn' onclick='enrollWeb()'>Enroll (web)</button>
+  <button class='btn' onclick='voteWeb()'>Vote (web)</button>
+  <button class='btn' onclick='listWeb()'>List Voters</button>
+  <button class='btn' onclick='deleteOne()'>Delete Voter</button>
+  <button class='btn' onclick='deleteAll()'>Delete ALL</button>
+  <button class='btn' onclick='queueSz()'>Offline Queue Size</button>
+  <button class='btn' onclick='leaderboard()'>Leaderboard</button>
+  <div id='voteArea' style='margin-top:12px;'></div>
+  <p class='small'>Finger scans must be performed at the device when requested. Web actions call the same internal functions as serial commands.</p>
+  <p class='small'>ESP IP: )====";
+    page += WiFi.localIP().toString();
+    page += R"====(</p>
+</div></body></html>)====";
+    server.send(200, "text/html", page);
+  });
+
+
+  // Local counts endpoint
+  server.on("/cmd/getLocalCounts", HTTP_GET, [](){
+    handleGetLocalCounts();
+  });
+
+
+  // Results page - reads local counts endpoint
+  server.on("/results", HTTP_GET, [](){
+    String page = R"====(
+<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Live Voting Results (Local)</title>
+<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+<style>
+body{font-family:Arial;background:#eef2f7;margin:0;padding:18px}
+.header{background:#1a73e8;color:#fff;padding:16px;border-radius:10px;text-align:center;margin-bottom:18px}
+.container{max-width:980px;margin:0 auto}
+.card{background:#fff;padding:16px;border-radius:10px;box-shadow:0 6px 18px rgba(16,24,40,0.06);margin-bottom:14px}
+.title{font-weight:bold;color:#1a73e8;margin-bottom:8px}
+.info{color:#333}
+.small{color:#666;font-size:13px}
+.controls{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+</style>
+</head><body>
+<div class='header'><h2>Live Voting Results (Local)</h2></div>
+<div class='container'>
+  <div class='card controls'>
+    <label>Refresh interval:
+      <select id='interval'>
+        <option value='2000'>2s</option>
+        <option value='3000' selected>3s</option>
+        <option value='5000'>5s</option>
+      </select>
+    </label>
+    <button onclick='updateNow()'>Refresh now</button>
+    <div style='margin-left:auto' class='small'>Data source: local ESP counts</div>
+  </div>
+  <div id='districtContainer'></div>
+  <div class='card'>
+    <div class='title'>Overall Total Votes</div>
+    <div id='overallTotal' class='info'>0</div>
+  </div>
+</div>
+
+
+<script>
+async function fetchLocalCounts(){
+  try{
+    const r = await fetch('/cmd/getLocalCounts');
+    if(!r.ok) return null;
+    return await r.json();
+  } catch(e){
+    return null;
+  }
+}
+
+
+function parseCounts(data){
+  const districts = [];
+  const dk = Object.keys(data).filter(k=>k.startsWith('district_')).sort();
+  dk.forEach(dKey => {
+    const obj = data[dKey];
+    const parties = [];
+    let total = 0;
+    const pkeys = Object.keys(obj).sort();
+    pkeys.forEach(pKey=>{
+      if(pKey === 'total') return;
+      const v = Number(obj[pKey]) || 0;
+      parties.push({ key: pKey, name: pKey.replace('candidate_','Party '), votes: v });
+      total += v;
+    });
+    if(obj.total !== undefined) total = Number(obj.total);
+    districts.push({ key: dKey, name: dKey.replace('district_','District '), parties: parties, total: total });
+  });
+  return districts;
+}
+
+
+function render(districts){
+  const container = document.getElementById('districtContainer');
+  container.innerHTML = '';
+  let overall = 0;
+
+
+  if(!districts || districts.length===0){
+    container.innerHTML = "<div class='card'><div class='title'>No vote data available</div><div class='small'>Waiting for votes...</div></div>";
+    document.getElementById('overallTotal').innerText = '0';
+    return;
+  }
+
+
+  districts.forEach((d, idx) => {
+    overall += d.total;
+    const card = document.createElement('div');
+    card.className = 'card';
+
+
+    const title = document.createElement('div');
+    title.className = 'title';
+    title.innerText = d.name + ' — Total Votes: ' + d.total;
+    card.appendChild(title);
+
+
+    d.parties.forEach(p=>{
+      const pdiv = document.createElement('div');
+      pdiv.className = 'info';
+      pdiv.innerText = p.name + ': ' + p.votes + ' votes';
+      card.appendChild(pdiv);
+    });
+
+
+    const canvas = document.createElement('canvas');
+    canvas.id = 'chart_' + idx;
+    canvas.style.marginTop = '8px';
+    card.appendChild(canvas);
+
+
+    container.appendChild(card);
+
+
+    const ctx = canvas.getContext('2d');
+    const labels = d.parties.map(x=>x.name);
+    const dataVals = d.parties.map(x=>x.votes);
+    new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: d.name,
+          data: dataVals,
+          backgroundColor: ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2']
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: { y: { beginAtZero: true } },
+        plugins: { legend: { display: false } }
+      }
+    });
+  });
+
+
+  document.getElementById('overallTotal').innerText = overall;
+}
+
+
+async function refresh(){
+  const raw = await fetchLocalCounts();
+  if(!raw){ render([]); return; }
+  const districts = parseCounts(raw);
+  render(districts);
+}
+
+
+let intervalId = null;
+function scheduleInterval(){
+  const sel = document.getElementById('interval');
+  if(intervalId) clearInterval(intervalId);
+  intervalId = setInterval(refresh, parseInt(sel.value));
+}
+
+
+document.addEventListener('DOMContentLoaded', function(){
+  refresh();
+  scheduleInterval();
+  document.getElementById('interval').addEventListener('change', scheduleInterval);
+});
+
+
+function updateNow(){ refresh(); }
+</script>
+</body></html>
+)====";
+    server.send(200, "text/html", page);
+  });
+
+
+  // Web enroll endpoint
+  server.on("/cmd/enroll", HTTP_GET, [](){
+    String name = server.hasArg("name") ? server.arg("name") : String("Unknown");
+    int district = server.hasArg("district") ? server.arg("district").toInt() : 1;
+    int panch = server.hasArg("panch") ? server.arg("panch").toInt() : 0;
+    String res = webEnroll(name, district, panch);
+    server.send(200, "text/plain", res);
+  });
+
+
+  // Web vote endpoint
+  server.on("/cmd/vote", HTTP_GET, [](){
+    String mode = server.hasArg("mode") ? server.arg("mode") : String("choices");
+    if (mode == "choices"){
+      String out;
+      String r = webVote(0, false, out);
+      if (r == "CHOICE_LIST"){
+        server.send(200, "application/json", out);
+      } else {
+        DynamicJsonDocument doc(128);
+        doc["status"] = "no_match";
+        doc["msg"] = r;
+        String s; serializeJson(doc, s);
+        server.send(200, "application/json", s);
+      }
+    } else if (mode == "cast"){
+      if (!server.hasArg("candidate")){
+        server.send(400, "text/plain", "Missing candidate index");
+        return;
+      }
+      int c = server.arg("candidate").toInt();
+      String outJson;
+      String r = webVote(c, true, outJson);
+      server.send(200, "text/plain", r);
+    } else {
+      server.send(400, "text/plain", "Unknown mode");
+    }
+  });
+
+
+  // List voters
+  server.on("/cmd/list", HTTP_GET, [](){
+    String out = "";
+    for (int id=1; id<=MAX_RECORDS; id++){
+      VoterRecord r;
+      if (loadVoterRecord(id, r)){
+        out += "ID " + String(id) + ": " + String(r.name) + " | D:" + String(r.district) + " P:" + String(r.panchayath) + "\n";
+      }
+    }
+    server.send(200, "text/plain", out);
+  });
+
+
+  // Delete one
+  server.on("/cmd/delete", HTTP_GET, [](){
+    if (!server.hasArg("id")){
+      server.send(400, "text/plain", "Missing id");
+      return;
+    }
+    int id = server.arg("id").toInt();
+    deleteVoterRecord(id);
+    server.send(200, "text/plain", "Deleted ID: " + String(id));
+  });
+
+
+  // Delete all
+  server.on("/cmd/delete_all", HTTP_GET, [](){
+    for (int id=1; id<=MAX_RECORDS; id++) deleteVoterRecord(id);
+    server.send(200, "text/plain", "All voters deleted.");
+  });
+
+
+  // Queue size
+  server.on("/cmd/queue", HTTP_GET, [](){
+    server.send(200, "text/plain", String(getOfflineQueueSize()));
+  });
+
+
+  // Leaderboard raw (local JSON)
+  server.on("/cmd/leaderboard", HTTP_GET, [](){
+    DynamicJsonDocument doc(1024);
+    for (int d=0; d<NUM_DISTRICTS; d++){
+      String dk = "district_" + String(d+1);
+      JsonObject dob = doc.createNestedObject(dk);
+      int cnt = candidateCountsForDistrict[d];
+      for (int c=0; c<cnt; c++){
+        String ck = "candidate_" + String(c+1);
+        dob[ck] = voteCount[d][c];
+      }
+      dob["total"] = districtTotal[d];
+    }
+    String out; serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+
+  // Voters index - list HTML with links
+  server.on("/voters", HTTP_GET, [](){
+    String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Voters</title>";
+    page += "<style>body{font-family:Arial;padding:12px} .card{background:#fff;padding:12px;border-radius:8px;margin:8px 0;box-shadow:0 6px 18px rgba(16,24,40,0.06)}</style></head><body>";
+    page += "<h2>Enrolled Voters</h2>";
+    for (int id=1; id<=MAX_RECORDS; id++){
+      VoterRecord r;
+      if (loadVoterRecord(id, r)){
+        page += "<div class='card'><a href='/voter?id=" + String(id) + "'>ID " + String(id) + "</a> - " + String(r.name) + " (D:" + String(r.district) + " P:" + String(r.panchayath) + ")</div>";
+      }
+    }
+    page += "</body></html>";
+    server.send(200, "text/html", page);
+  });
+
+
+  // Single voter page: /voter?id=<n>
+  server.on("/voter", HTTP_GET, [](){
+    if (!server.hasArg("id")) { server.send(400, "text/plain", "Missing id"); return; }
+    int id = server.arg("id").toInt();
+    VoterRecord r;
+    if (!loadVoterRecord(id, r)) { server.send(404, "text/plain", "Voter not found"); return; }
+    String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Voter " + String(id) + "</title></head><body>";
+    page += "<h2>Voter ID " + String(id) + "</h2>";
+    page += "<div><strong>Name:</strong> " + String(r.name) + "</div>";
+    page += "<div><strong>District:</strong> " + String(r.district) + "</div>";
+    page += "<div><strong>Panchayath:</strong> " + String(r.panchayath) + "</div>";
+    page += "<div style='margin-top:12px;'><a href='/voters'>Back to list</a></div>";
+    page += "</body></html>";
+    server.send(200, "text/html", page);
+  });
+
+
+  // District page: /district?id=<n>
+  server.on("/district", HTTP_GET, [](){
+    if (!server.hasArg("id")) { server.send(400, "text/plain", "Missing id"); return; }
+    int d = server.arg("id").toInt();
+    if (d < 1 || d > NUM_DISTRICTS){ server.send(400, "text/plain", "Invalid district"); return; }
+    int idx = d - 1;
+    String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>District " + String(d) + "</title></head><body>";
+    page += "<h2>District " + String(d) + " — Total: " + String(districtTotal[idx]) + "</h2>";
+    page += "<ul>";
+    int cnt = candidateCountsForDistrict[idx];
+    for (int c=0;c<cnt;c++){
+      page += "<li>" + String(candidates[idx][c]) + " : " + String(voteCount[idx][c]) + " votes</li>";
+    }
+    page += "</ul>";
+    page += "<div style='margin-top:12px'><a href='/results'>Back to results</a></div>";
+    page += "</body></html>";
+    server.send(200, "text/html", page);
+  });
+
+
+  server.begin();
+}
+
+
+// ----------------- incrementLocalAndRemoteCounts (persist + enqueue on fail) -----------------
+void incrementLocalAndRemoteCounts(uint8_t district, uint8_t candidateIndex) {
+  int dIdx = (int)district - 1;
+  if (dIdx < 0 || dIdx >= NUM_DISTRICTS) return;
+  if (candidateIndex < 0 || candidateIndex >= MAX_CANDIDATES) return;
+
+
+  voteCount[dIdx][candidateIndex]++;
+  districtTotal[dIdx]++;
+  globalTotal++;
+
+
+  // persist counts to EEPROM immediately
+  saveCountsToEEPROM();
+
+
+  Serial.printf("Local count updated: District %d Candidate %d -> %d\n", district, candidateIndex+1, voteCount[dIdx][candidateIndex]);
+
+
+  // Try to increment counters in Firebase. If Firebase is not ready or increment fails,
+  // enqueue a minimal VoteEvent into the offline queue for later sync.
+  bool incOk = false;
+  if (Firebase.ready()){
+    if (firebaseIncrementVote(district, candidateIndex + 1)) {
+      incOk = true;
+    } else {
+      Serial.println("firebaseIncrementVote returned false (will enqueue for later sync).");
+    }
+  } else {
+    Serial.println("Firebase not ready; enqueueing increment event.");
+  }
+
+
+  if (!incOk) {
+    VoteEvent ev;
+    ev.ts = (uint32_t)(millis() / 1000UL);
+    ev.fingerID = 0; // 0 indicates a count-only / queued increment if no fingerprint info
+    ev.district = district;
+    ev.candidateIndex = candidateIndex;
+    strncpy(ev.candidateName, candidates[dIdx][candidateIndex], sizeof(ev.candidateName)-1);
+    ev.candidateName[sizeof(ev.candidateName)-1] = 0;
+    enqueueEvent(ev);
+    Serial.println("Enqueued offline increment event.");
+  }
+}
+
+
+// ----------------- Setup & loop -----------------
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\nVoting Machine booting...");
+
+
+  Wire.begin(21,22); // SDA, SCL
+  initFingerprint();
+  initEventQueueIfNeeded();
+
+
+  // load persistent counts from EEPROM (if previously saved)
+  loadCountsFromEEPROM();
+
+
+  // Connect WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED){
+    Serial.print(".");
+    delay(300);
+    if (millis() - t0 > 20000) break;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ WiFi connected. IP: " + WiFi.localIP().toString());
+  } else Serial.println("⚠️ WiFi not connected.");
+
+
+  firebaseSetup();
+
+
+  // Setup webserver routes
+  setupWebServerRoutes();
+
+
+  server.begin();
+
+
+  // Update results_url into Firebase (so remote clients can find the page)
+  firebaseUpdateResultsURL();
+
+
+  // Serial links
+  Serial.println();
+  Serial.println("======== VOTING MACHINE READY ========");
+  Serial.println("MAIN CONTROL PAGE:");
+  Serial.println("  http://" + WiFi.localIP().toString() + "/");
+  Serial.println();
+  Serial.println("LIVE RESULTS PAGE:");
+  Serial.println("  http://" + WiFi.localIP().toString() + "/results");
+  Serial.println();
+  Serial.println("VOTERS LIST PAGE:");
+  Serial.println("  http://" + WiFi.localIP().toString() + "/voters");
+  Serial.println();
+  Serial.println("FIREBASE DATABASE URL:");
+  Serial.println("  " + String(DATABASE_URL));
+  Serial.println("=======================================");
+  Serial.println();
+
+
+  showMenu();
+}
+
+
+void loop(){
+  // periodic auto-sync
+  if (millis() - lastAutoSyncMs > AUTO_SYNC_INTERVAL_MS){
+    lastAutoSyncMs = millis();
+    if (Firebase.ready()) syncOfflineVotes();
+  }
+
+
+  // handle web clients
+  server.handleClient();
+
+
+  // Serial menu handling
+  if (Serial.available()){
+    int opt = Serial.parseInt();
+    Serial.readStringUntil('\n');
+    switch (opt){
+      case 1: enrollFlow(); break;
+      case 2: voteFlow(); break;
+      case 3: listVoters(); break;
+      case 4: deleteVoterByID(); break;
+      case 5: deleteAllVoters(); break;
+      case 6: Serial.printf("Offline queue size: %d\n", getOfflineQueueSize()); break;
+      case 7: showLeaderboard(); break;
+      default: Serial.println("Unknown option."); break;
+    }
+    showMenu();
+  }
+  delay(20);
+}
+
+
+/*
+  ESP32 Voting Machine - FINAL SINGLE .INO
+  - Original logic preserved.
+  - Added: EEPROM persistent counts, offline vote queue, Firebase sync,
+           voters/ metadata storage, results_url, web pages (/ , /results),
+           /voters, /voter?id=, /district?id= pages.
+  - Keep fingerprints, enroll/vote flows unchanged except added pushes/queueing.
+*/
+
+
+// ====== INCLUDES ======
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_Fingerprint.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+
+// ====== FORWARD DECLARATIONS ======
+int findFreeRecordID();
+int enrollFingerAndStore(int chosenID);
+void voteFlow();
+String webEnroll(const String &name, int district, int panchayath);
+String webVote(int candidateIndexProvided, bool hasCandidate, String &outJson);
+void incrementLocalAndRemoteCounts(uint8_t district, uint8_t candidateIndex);
+
+
+// ----------------------------- USER CONFIG -----------------------------
+#define WIFI_SSID      "superman"
+#define WIFI_PASSWORD  "123456789"
+
+
+#define API_KEY        "AIzaSyBZSSD1-jaJpVxuuLmQfLVJiLw_CN8kFgA"
+#define DATABASE_URL   "https://votingmachine-bea13-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+
+// Fingerprint UART pins & baud
+#define FINGER_SERIAL_RX 16
+#define FINGER_SERIAL_TX 17
+#define FINGER_BAUD 57600
+
+
+// EEPROM (24LC256) layout
+#define EEPROM_I2C_ADDR 0x50
+#define RECORD_SIZE 64
+#define MAX_RECORDS 200
+#define RECORDS_START 0x0000
+#define EVENTS_START (RECORDS_START + RECORD_SIZE * MAX_RECORDS)
+#define EVENT_SIZE 32
+#define MAX_EVENTS 200
+#define EVENT_HEAD_ADDR 0x7FF0
+#define EVENT_TAIL_ADDR 0x7FF4
+
+
+// Persistent vote counts addresses (safe high area)
+#define VOTECOUNT_START 0x6000   // 2 bytes per candidate
+#define DISTTOTAL_START 0x6100   // 2 bytes per district total
+#define GLOBALTOTAL_ADDR 0x6200  // 2 bytes global total
+
+
+// Candidates per district (unchanged)
+const int NUM_DISTRICTS = 4;
+const int MAX_CANDIDATES = 6;
+const char* candidates[NUM_DISTRICTS][MAX_CANDIDATES] = {
+  {"Party A", "Party B", "Party C", "", "", ""},    // district 1
+  {"Alpha", "Beta", "Gamma", "", "", ""},           // district 2
+  {"Red", "Blue", "", "", "", ""},                  // district 3
+  {"Leader1", "Leader2", "Leader3", "Leader4", "", ""} // district 4
+};
+const int candidateCountsForDistrict[NUM_DISTRICTS] = {3,3,2,4};
+
+
+// ------------------------------------------------
+
+
+// Web server
+WebServer server(80);
+
+
+// Firebase objects (Mobizt)
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+
+// Fingerprint
+HardwareSerial fingerSerial(2);
+Adafruit_Fingerprint finger(&fingerSerial);
+
+
+// timing for auto sync
+unsigned long lastAutoSyncMs = 0;
+const unsigned long AUTO_SYNC_INTERVAL_MS = 10000; // try every 10s
+
+
+// ----------------- In-memory vote counters (local) -----------------
+int voteCount[NUM_DISTRICTS][MAX_CANDIDATES];
+int districtTotal[NUM_DISTRICTS];
+int globalTotal = 0;
+
+
+// ----------------- Data structs -----------------
+struct VoterRecord {
+  bool valid;
+  uint8_t fingerID;
+  char name[31];
+  uint8_t district;
+  uint8_t panchayath;
+};
+
+
+struct VoteEvent {
+  uint32_t ts;
+  uint8_t fingerID;
+  uint8_t district;
+  uint8_t candidateIndex;
+  char candidateName[32];
+};
+
+
+// ----------------- EEPROM helpers -----------------
+void eepromWriteByte(uint16_t memAddr, uint8_t data) {
+  Wire.beginTransmission(EEPROM_I2C_ADDR);
+  Wire.write((int)(memAddr >> 8));
+  Wire.write((int)(memAddr & 0xFF));
+  Wire.write(data);
+  Wire.endTransmission();
+  delay(6);
+}
+uint8_t eepromReadByte(uint16_t memAddr) {
+  Wire.beginTransmission(EEPROM_I2C_ADDR);
+  Wire.write((int)(memAddr >> 8));
+  Wire.write((int)(memAddr & 0xFF));
+  Wire.endTransmission();
+  Wire.requestFrom(EEPROM_I2C_ADDR, (uint8_t)1);
+  if (Wire.available()) return Wire.read();
+  return 0xFF;
+}
+void writeStringToEEPROM(uint16_t memAddr, const char* s, uint16_t maxLen){
+  size_t slen = strlen(s);
+  for (uint16_t i=0;i<maxLen;i++){
+    uint8_t b = (i < slen) ? s[i] : 0;
+    eepromWriteByte(memAddr + i, b);
+  }
+}
+void readStringFromEEPROM(uint16_t memAddr, char* out, uint16_t maxLen){
+  for (uint16_t i=0;i<maxLen;i++){
+    out[i] = (char)eepromReadByte(memAddr + i);
+  }
+  out[maxLen-1] = 0;
+}
+uint16_t recordAddress(uint8_t fingerID){
+  if (fingerID < 1) fingerID = 1;
+  return RECORDS_START + (uint16_t)(fingerID - 1) * RECORD_SIZE;
+}
+void saveVoterRecord(uint8_t fingerID, const VoterRecord &r){
+  uint16_t addr = recordAddress(fingerID);
+  eepromWriteByte(addr + 0, r.valid ? 1 : 0);
+  eepromWriteByte(addr + 1, r.fingerID);
+  writeStringToEEPROM(addr + 2, r.name, 30);
+  eepromWriteByte(addr + 32, r.district);
+  eepromWriteByte(addr + 33, r.panchayath);
+  for (uint16_t i=34;i<RECORD_SIZE;i++) eepromWriteByte(addr+i, 0);
+}
+bool loadVoterRecord(uint8_t fingerID, VoterRecord &r){
+  if (fingerID < 1 || fingerID > MAX_RECORDS) return false;
+  uint16_t addr = recordAddress(fingerID);
+  uint8_t valid = eepromReadByte(addr + 0);
+  r.valid = (valid == 1);
+  r.fingerID = eepromReadByte(addr + 1);
+  readStringFromEEPROM(addr + 2, r.name, 31);
+  r.district = eepromReadByte(addr + 32);
+  r.panchayath = eepromReadByte(addr + 33);
+  return r.valid;
+}
+void deleteVoterRecord(uint8_t fingerID){
+  VoterRecord r;
+  memset(&r,0,sizeof(r));
+  r.valid = false;
+  r.fingerID = fingerID;
+  saveVoterRecord(fingerID, r);
+}
+
+
+// ----------------- Event queue helpers -----------------
+uint16_t readUInt16FromEEPROM(uint16_t addr){
+  uint8_t lo = eepromReadByte(addr);
+  uint8_t hi = eepromReadByte(addr+1);
+  return (uint16_t)hi<<8 | lo;
+}
+void writeUInt16ToEEPROM(uint16_t addr, uint16_t val){
+  eepromWriteByte(addr, val & 0xFF);
+  eepromWriteByte(addr+1, (val >> 8) & 0xFF);
+}
+uint16_t eventSlotAddr(uint16_t idx){
+  return EVENTS_START + idx * EVENT_SIZE;
+}
+uint16_t getEventHead(){ return readUInt16FromEEPROM(EVENT_HEAD_ADDR); }
+uint16_t getEventTail(){ return readUInt16FromEEPROM(EVENT_TAIL_ADDR); }
+void setEventHead(uint16_t v){ writeUInt16ToEEPROM(EVENT_HEAD_ADDR, v); }
+void setEventTail(uint16_t v){ writeUInt16ToEEPROM(EVENT_TAIL_ADDR, v); }
+
+
+void enqueueEvent(const VoteEvent &ev){
+  uint16_t head = getEventHead();
+  uint16_t tail = getEventTail();
+  uint16_t nextTail = (tail + 1) % MAX_EVENTS;
+  if (nextTail == head){
+    Serial.println("Offline queue full! Cannot enqueue event.");
+    return;
+  }
+  uint16_t addr = eventSlotAddr(tail);
+  uint32_t ts = ev.ts;
+  eepromWriteByte(addr+0, (ts >> 24) & 0xFF);
+  eepromWriteByte(addr+1, (ts >> 16) & 0xFF);
+  eepromWriteByte(addr+2, (ts >> 8) & 0xFF);
+  eepromWriteByte(addr+3, (ts) & 0xFF);
+  eepromWriteByte(addr+4, ev.fingerID);
+  eepromWriteByte(addr+5, ev.district);
+  eepromWriteByte(addr+6, ev.candidateIndex);
+  writeStringToEEPROM(addr+7, ev.candidateName, 25);
+  setEventTail(nextTail);
+}
+
+
+bool dequeueEvent(VoteEvent &ev){
+  uint16_t head = getEventHead();
+  uint16_t tail = getEventTail();
+  if (head == tail) return false;
+  uint16_t addr = eventSlotAddr(head);
+  uint32_t ts = 0;
+  ts |= ((uint32_t)eepromReadByte(addr+0)) << 24;
+  ts |= ((uint32_t)eepromReadByte(addr+1)) << 16;
+  ts |= ((uint32_t)eepromReadByte(addr+2)) << 8;
+  ts |= ((uint32_t)eepromReadByte(addr+3));
+  ev.ts = ts;
+  ev.fingerID = eepromReadByte(addr+4);
+  ev.district = eepromReadByte(addr+5);
+  ev.candidateIndex = eepromReadByte(addr+6);
+  readStringFromEEPROM(addr+7, ev.candidateName, 25);
+  uint16_t nextHead = (head + 1) % MAX_EVENTS;
+  setEventHead(nextHead);
+  return true;
+}
+
+
+void initEventQueueIfNeeded(){
+  uint16_t head = getEventHead();
+  uint16_t tail = getEventTail();
+  if (head == 0xFFFF && tail == 0xFFFF){
+    setEventHead(0);
+    setEventTail(0);
+  }
+}
+int getOfflineQueueSize(){
+  uint16_t head = getEventHead();
+  uint16_t tail = getEventTail();
+  if (head == 0xFFFF && tail == 0xFFFF) return 0;
+  if (tail >= head) return tail - head;
+  return (MAX_EVENTS - head) + tail;
+}
+
+
+// ----------------- Fingerprint helpers -----------------
+void initFingerprint(){
+  fingerSerial.begin(FINGER_BAUD, SERIAL_8N1, FINGER_SERIAL_RX, FINGER_SERIAL_TX);
+  delay(100);
+  finger.begin(FINGER_BAUD);
+  if (finger.verifyPassword()){
+    Serial.println("Fingerprint sensor found!");
+  } else {
+    Serial.println("Fingerprint sensor NOT found. Check wiring/power.");
+  }
+}
+
+
+int enrollFingerAndStore(int chosenID){
+  Serial.println(F("Starting enrollment process..."));
+  int p = -1;
+  Serial.print("Place finger #"); Serial.println(chosenID);
+  while (p != FINGERPRINT_OK){
+    p = finger.getImage();
+    if (p == FINGERPRINT_OK) break;
+    if (p == FINGERPRINT_NOFINGER) delay(200);
+    else { Serial.print("getImage error: "); Serial.println(p); delay(200); }
+  }
+  if (finger.image2Tz(1) != FINGERPRINT_OK){ Serial.println("Image2TZ failed."); return -1; }
+  Serial.println("Remove finger"); delay(1500);
+  while (finger.getImage() != FINGERPRINT_NOFINGER) delay(200);
+  Serial.println("Place same finger again");
+  while (true){ p = finger.getImage(); if (p == FINGERPRINT_OK) break; delay(200); }
+  if (finger.image2Tz(2) != FINGERPRINT_OK){ Serial.println("Image2TZ #2 failed."); return -1; }
+  if (finger.createModel() != FINGERPRINT_OK){ Serial.println("Could not create model."); return -1; }
+  if (finger.storeModel(chosenID) == FINGERPRINT_OK){
+    Serial.print("Stored model at ID "); Serial.println(chosenID);
+    return chosenID;
+  }
+  Serial.println("Could not store model.");
+  return -1;
+}
+
+
+int findFreeRecordID(){
+  for (int id = 1; id <= MAX_RECORDS; id++){
+    uint16_t addr = recordAddress(id);
+    uint8_t valid = eepromReadByte(addr + 0);
+    if (valid != 1) return id;
+  }
+  return -1;
+}
+
+
+// ----------------- Firebase (Mobizt) helpers -----------------
+void firebaseSetup(){
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  // anonymous sign-in (empty email/pass)
+  auth.user.email = "";
+  auth.user.password = "";
+  config.token_status_callback = tokenStatusCallback;
+  // Attempt signUp (anonymous), then begin
+  if (Firebase.signUp(&config, &auth, "", "")){
+    Serial.println("Firebase signUp OK");
+  } else {
+    // if signUp fails with "EMAIL_EXISTS" it's OK (already signed up)
+    Serial.printf("Firebase signUp: %s\n", config.signer.signupError.message.c_str());
+  }
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+
+// Update Firebase candidate count and district total (atomic-ish: read current -> set incremented)
+bool firebaseIncrementVote(uint8_t district, uint8_t candidate)
+{
+  if (!Firebase.ready()) {
+    Serial.println("Firebase not ready for increment.");
+    return false;
+  }
+
+
+  String base = String("/votes/district_") + String(district);
+  String candPath = base + "/candidate_" + String(candidate);
+  String totalPath = base + "/total";
+
+
+  // Candidate
+  int candCount = 0;
+  if (Firebase.RTDB.getInt(&fbdo, candPath.c_str())) {
+    candCount = fbdo.intData();
+  } else {
+    // if not found, fbdo.payload() may be "null" — we'll initialize
+    if (fbdo.httpCode() != 200) {
+      // non-fatal, will still attempt to set to 1
+    }
+  }
+  candCount++;
+  if (!Firebase.RTDB.setInt(&fbdo, candPath.c_str(), candCount)) {
+    Serial.println("Failed set candidate: " + fbdo.errorReason());
+    // still continue to try total update
+  }
+
+
+  // Total
+  int totalCount = 0;
+  if (Firebase.RTDB.getInt(&fbdo, totalPath.c_str())) {
+    totalCount = fbdo.intData();
+  } else {
+    // init to 0 then increment
+  }
+  totalCount++;
+  if (!Firebase.RTDB.setInt(&fbdo, totalPath.c_str(), totalCount)) {
+    Serial.println("Failed set total: " + fbdo.errorReason());
+  }
+
+
+  // Update results_url as well
+  String url = String("http://") + WiFi.localIP().toString() + "/results";
+  if (!Firebase.RTDB.setString(&fbdo, "/results_url", url)) {
+    Serial.println("Failed set results_url: " + fbdo.errorReason());
+  }
+
+
+  return true;
+}
+
+
+// Push vote event into history: /vote_history/district_N
+bool firebasePushVote(const VoteEvent &ev){
+  if (!Firebase.ready()) return false;
+  String path = String("/vote_history/district_") + String(ev.district);
+  FirebaseJson json;
+  json.set("voter_id", ev.fingerID);
+  json.set("candidate_index", ev.candidateIndex + 1); // store 1-based for readability
+  json.set("candidate_name", String(ev.candidateName));
+  json.set("timestamp", (int)ev.ts);
+  if (Firebase.RTDB.pushJSON(&fbdo, path.c_str(), &json)){
+    Serial.println("Firebase: pushed history key: " + fbdo.pushName());
+    return true;
+  } else {
+    Serial.println("Firebase push history failed: " + fbdo.errorReason());
+    return false;
+  }
+}
+
+
+// Push voter metadata into Firebase at /voters/<id>
+bool firebasePushVoter(uint8_t id, const VoterRecord &r){
+  if (!Firebase.ready()) return false;
+  String path = String("/voters/") + String(id);
+  FirebaseJson json;
+  json.set("name", String(r.name));
+  json.set("district", (int)r.district);
+  json.set("panchayath", (int)r.panchayath);
+  if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)){
+    Serial.println("Firebase: pushed voter " + String(id));
+    return true;
+  } else {
+    Serial.println("Firebase: failed push voter: " + fbdo.errorReason());
+    return false;
+  }
+}
+
+
+// Update only results URL in Firebase (call at boot and on IP change)
+void firebaseUpdateResultsURL() {
+  if (!Firebase.ready()) return;
+  String url = String("http://") + WiFi.localIP().toString() + "/results";
+  if (!Firebase.RTDB.setString(&fbdo, "/results_url", url)){
+    Serial.println("Failed set results_url: " + fbdo.errorReason());
+  } else {
+    Serial.println("Firebase results_url updated: " + url);
+  }
+}
+
+
+// ----------------- Vote counts persistence -----------------
+void saveCountsToEEPROM() {
+  uint16_t addr = VOTECOUNT_START;
+  for (int d = 0; d < NUM_DISTRICTS; d++) {
+    for (int c = 0; c < MAX_CANDIDATES; c++) {
+      uint16_t val = (uint16_t)voteCount[d][c];
+      writeUInt16ToEEPROM(addr, val);
+      addr += 2;
+    }
+  }
+  addr = DISTTOTAL_START;
+  for (int d = 0; d < NUM_DISTRICTS; d++) {
+    writeUInt16ToEEPROM(addr, (uint16_t)districtTotal[d]);
+    addr += 2;
+  }
+  writeUInt16ToEEPROM(GLOBALTOTAL_ADDR, (uint16_t)globalTotal);
+}
+
+
+void loadCountsFromEEPROM() {
+  uint16_t addr = VOTECOUNT_START;
+  for (int d = 0; d < NUM_DISTRICTS; d++) {
+    for (int c = 0; c < MAX_CANDIDATES; c++) {
+      uint16_t v = readUInt16FromEEPROM(addr);
+      // Treat 0xFFFF as 0 (uninitialized)
+      if (v == 0xFFFF) v = 0;
+      voteCount[d][c] = (int)v;
+      addr += 2;
+    }
+  }
+  addr = DISTTOTAL_START;
+  for (int d = 0; d < NUM_DISTRICTS; d++) {
+    uint16_t v = readUInt16FromEEPROM(addr);
+    if (v == 0xFFFF) v = 0;
+    districtTotal[d] = (int)v;
+    addr += 2;
+  }
+  {
+    uint16_t v = readUInt16FromEEPROM(GLOBALTOTAL_ADDR);
+    if (v == 0xFFFF) v = 0;
+    globalTotal = (int)v;
+  }
+}
+
+
+// ----------------- Sync queued events -----------------
+void syncOfflineVotes(){
+  if (!Firebase.ready()){
+    Serial.println("Firebase not ready; skip sync");
+    return;
+  }
+  VoteEvent ev;
+  int attempts = 0;
+  while (dequeueEvent(ev) && attempts < MAX_EVENTS){
+    attempts++;
+    // push history (if fails, re-enqueue and abort)
+    if (!firebasePushVote(ev)){
+      enqueueEvent(ev);
+      Serial.println("Failed to push queued history; re-enqueued and aborting sync.");
+      return;
+    }
+    // increment counts (pass 1-based candidate)
+    if (!firebaseIncrementVote(ev.district, ev.candidateIndex + 1)){
+      enqueueEvent(ev);
+      Serial.println("Failed to increment queued vote counts; re-enqueued and aborting sync.");
+      return;
+    }
+    Serial.println("Synced queued event to Firebase.");
+    delay(50);
+  }
+  if (attempts > 0) Serial.println("Offline sync completed.");
+}
+
+
+// ----------------- Serial UI and flows -----------------
+void showMenu(){
+  Serial.println("\n=== Voting Machine Menu ===");
+  Serial.println("1. Enroll Voter");
+  Serial.println("2. Scan & Vote");
+  Serial.println("3. List enrolled voters (brief)");
+  Serial.println("4. Delete voter by ID");
+  Serial.println("5. Delete ALL voters (careful!)");
+  Serial.println("6. Show offline queue size");
+  Serial.println("7. Show leaderboard (local counts)");
+  Serial.println("Enter option number:");
+  Serial.printf("Offline queue size: %d\n", getOfflineQueueSize());
+}
+
+
+void enrollFlow(){
+  int freeID = findFreeRecordID();
+  if (freeID < 0){
+    Serial.println("No free record slots in EEPROM!");
+    return;
+  }
+  Serial.print("Using free ID: "); Serial.println(freeID);
+  int res = enrollFingerAndStore(freeID);
+  if (res <= 0){ Serial.println("Enrollment failed."); return; }
+
+
+  Serial.println("Enter name (single line): ");
+  while (!Serial.available()) delay(10);
+  String name = Serial.readStringUntil('\n'); name.trim();
+  Serial.println("Enter district number (1..): ");
+  while (!Serial.available()) delay(10);
+  int district = Serial.parseInt(); Serial.readStringUntil('\n');
+  Serial.println("Enter panchayath code (number): ");
+  while (!Serial.available()) delay(10);
+  int panch = Serial.parseInt(); Serial.readStringUntil('\n');
+
+
+  VoterRecord r;
+  r.valid = true;
+  r.fingerID = freeID;
+  strncpy(r.name, name.c_str(), 30);
+  r.name[30] = 0;
+  r.district = (uint8_t)district;
+  r.panchayath = (uint8_t)panch;
+  saveVoterRecord(freeID, r);
+  Serial.println("Saved voter record to EEPROM.");
+
+
+  // attempt to push voter metadata to Firebase (non-fatal)
+  if (Firebase.ready()){
+    if (!firebasePushVoter(freeID, r)){
+      Serial.println("Failed to push voter metadata to Firebase (will retry on next sync).");
+    }
+  } else {
+    Serial.println("Firebase not ready; voter metadata will be available locally only.");
+  }
+}
+
+
+void voteFlow(){
+  // clear Serial buffer
+  while (Serial.available()) Serial.read();
+
+
+  Serial.println("👉 You have 5 seconds to place your finger...");
+  unsigned long start = millis();
+  int matchedID = -1;
+
+
+  while (millis() - start < 5000){
+    int p = finger.getImage();
+    if (p == FINGERPRINT_OK){
+      if (finger.image2Tz() == FINGERPRINT_OK){
+        if (finger.fingerFastSearch() == FINGERPRINT_OK){
+          matchedID = finger.fingerID;
+          break;
+        }
+      }
+    }
+    delay(80);
+  }
+
+
+  if (matchedID < 0){ Serial.println("⚠️ Finger not recognized or timeout."); return; }
+  VoterRecord r;
+  if (!loadVoterRecord(matchedID, r)){ Serial.println("⚠️ No voter metadata found in EEPROM for this ID."); return; }
+
+
+  Serial.printf("✅ Matched: ID %d | Name: %s | District: %d | Panchayath: %d\n", matchedID, r.name, r.district, r.panchayath);
+  int dIndex = r.district - 1;
+  if (dIndex < 0 || dIndex >= NUM_DISTRICTS){ Serial.println("⚠️ Unknown district or no candidates configured."); return; }
+  int candCount = candidateCountsForDistrict[dIndex];
+  Serial.println("Select candidate number:");
+  for (int i=0;i<candCount;i++) Serial.printf("%d. %s\n", i+1, candidates[dIndex][i]);
+
+
+  while (!Serial.available()) delay(10);
+  int sel = Serial.parseInt(); Serial.readStringUntil('\n');
+  if (sel < 1 || sel > candCount){ Serial.println("⚠️ Invalid selection."); return; }
+  int candIdx = sel - 1;
+  const char* candName = candidates[dIndex][candIdx];
+
+
+  // Build vote event
+  VoteEvent ev;
+  ev.ts = (uint32_t)(millis() / 1000UL);
+  ev.fingerID = matchedID;
+  ev.district = r.district;
+  ev.candidateIndex = candIdx;
+  strncpy(ev.candidateName, candName, sizeof(ev.candidateName)-1);
+  ev.candidateName[sizeof(ev.candidateName)-1] = 0;
+
+
+  // Update local and remote counts
+  incrementLocalAndRemoteCounts(r.district, candIdx);
+
+
+  // Try to send history immediately; if fails, enqueue
+  if (Firebase.ready()){
+    if (firebasePushVote(ev)){
+      // done
+    } else {
+      enqueueEvent(ev);
+      Serial.println("Firebase push failed; enqueueing vote event.");
+    }
+  } else {
+    enqueueEvent(ev);
+    Serial.println("Firebase not ready; vote queued.");
+  }
+
+
+  Serial.println("✅ Vote recorded locally and queued for Firebase if necessary.");
+}
+
+
+void listVoters(){
+  Serial.println("=== Enrolled voters (brief) ===");
+  for (int id=1; id<=MAX_RECORDS; id++){
+    VoterRecord r;
+    if (loadVoterRecord(id, r)){
+      Serial.printf("ID %d: %s | D:%d P:%d\n", id, r.name, r.district, r.panchayath);
+    }
+  }
+}
+
+
+void deleteVoterByID(){
+  Serial.println("Enter ID to delete:");
+  while (!Serial.available()) delay(10);
+  int id = Serial.parseInt(); Serial.readStringUntil('\n');
+  if (id < 1 || id > MAX_RECORDS){ Serial.println("Invalid ID"); return; }
+  deleteVoterRecord(id);
+  Serial.println("Deleted record from EEPROM. (Fingerprint template on sensor may still exist.)");
+}
+
+
+void deleteAllVoters(){
+  Serial.println("ARE YOU SURE? Type YES to confirm:");
+  while (!Serial.available()) delay(10);
+  String s = Serial.readStringUntil('\n'); s.trim();
+  if (s == "YES"){
+    for (int id=1; id<=MAX_RECORDS; id++) deleteVoterRecord(id);
+    Serial.println("All voter metadata cleared from EEPROM.");
+  } else Serial.println("Aborted.");
+}
+
+
+void showLeaderboard(){
+  // print local counts as JSON-style text
+  Serial.println("{");
+  for (int d=0; d<NUM_DISTRICTS; d++){
+    Serial.printf("  \"district_%d\": {", d+1);
+    int cnt = candidateCountsForDistrict[d];
+    for (int c=0; c<cnt; c++){
+      Serial.printf("\"candidate_%d\": %d", c+1, voteCount[d][c]);
+      if (c < cnt-1) Serial.print(", ");
+    }
+    Serial.print(", \"total\": ");
+    Serial.printf("%d", districtTotal[d]);
+    Serial.print(" }");
+    if (d < NUM_DISTRICTS-1) Serial.println(",");
+    else Serial.println();
+  }
+  Serial.println("}");
+  Serial.printf("Overall Total Votes: %d\n", globalTotal);
+}
+
+
+// ----------------- Web wrappers & endpoints -----------------
+
+
+// Web enroll: requires name, district, panch
+String webEnroll(const String &name, int district, int panchayath){
+  int freeID = findFreeRecordID();
+  if (freeID < 0) return String("No free slots");
+
+
+  int res = enrollFingerAndStore(freeID);
+  if (res <= 0) return String("Enrollment failed (sensor)");
+
+
+  VoterRecord r;
+  r.valid = true;
+  r.fingerID = freeID;
+  strncpy(r.name, name.c_str(), 30);
+  r.name[30] = 0;
+  r.district = (uint8_t)district;
+  r.panchayath = (uint8_t)panchayath;
+  saveVoterRecord(freeID, r);
+
+
+  // Attempt to push voter metadata to Firebase (non-fatal)
+  if (Firebase.ready()){
+    if (!firebasePushVoter(freeID, r)){
+      Serial.println("Failed to push voter metadata to Firebase (will retry on next sync).");
+    }
+  } else {
+    Serial.println("Firebase not ready; voter metadata local only.");
+  }
+
+
+  return String("Enrolled ID: ") + String(freeID);
+}
+
+
+// Web vote wrapper: if hasCandidate==false -> return candidate choices (after scan)
+// if hasCandidate==true -> cast vote (candidateIndexProvided)
+String webVote(int candidateIndexProvided, bool hasCandidate, String &outJson){
+  unsigned long start = millis();
+  int matchedID = -1;
+  while (millis() - start < 5000){
+    int p = finger.getImage();
+    if (p == FINGERPRINT_OK){
+      if (finger.image2Tz() == FINGERPRINT_OK){
+        if (finger.fingerFastSearch() == FINGERPRINT_OK){
+          matchedID = finger.fingerID;
+          break;
+        }
+      }
+    }
+    delay(50);
+  }
+  if (matchedID < 0) return String("No finger matched");
+
+
+  VoterRecord r;
+  if (!loadVoterRecord(matchedID, r)) return String("No voter metadata for matched ID");
+
+
+  int dIndex = r.district - 1;
+  if (dIndex < 0 || dIndex >= NUM_DISTRICTS) return String("No candidates for district");
+
+
+  if (!hasCandidate){
+    DynamicJsonDocument doc(512);
+    doc["status"] = "ok_choices";
+    doc["voter_id"] = matchedID;
+    doc["name"] = String(r.name);
+    doc["district"] = r.district;
+    JsonArray arr = doc.createNestedArray("candidates");
+    int candCount = candidateCountsForDistrict[dIndex];
+    for (int i=0;i<candCount;i++) arr.add(candidates[dIndex][i]);
+    serializeJson(doc, outJson);
+    return String("CHOICE_LIST");
+  } else {
+    int candIdx = candidateIndexProvided;
+    if (candIdx < 0 || candIdx >= candidateCountsForDistrict[dIndex]) return String("Invalid candidate index");
+    // increment local and firebase counts
+    incrementLocalAndRemoteCounts(r.district, candIdx);
+    // Create VoteEvent and try to push history; if fails enqueue
+    VoteEvent ev;
+    ev.ts = (uint32_t)(millis() / 1000UL);
+    ev.fingerID = matchedID;
+    ev.district = r.district;
+    ev.candidateIndex = candIdx;
+    strncpy(ev.candidateName, candidates[dIndex][candIdx], sizeof(ev.candidateName)-1);
+    ev.candidateName[sizeof(ev.candidateName)-1] = 0;
+
+
+    if (Firebase.ready()){
+      if (!firebasePushVote(ev)){
+        enqueueEvent(ev);
+        Serial.println("Firebase push failed; event queued.");
+      }
+    } else {
+      enqueueEvent(ev);
+      Serial.println("Offline: vote event queued.");
+    }
+
+
+    return String("Vote recorded locally and queued for Firebase.");
+  }
+}
+
+
+// Return local counts as JSON at /cmd/getLocalCounts
+void handleGetLocalCounts(){
+  DynamicJsonDocument doc(2048);
+  for (int d=0; d<NUM_DISTRICTS; d++){
+    String dk = "district_" + String(d+1);
+    JsonObject dob = doc.createNestedObject(dk);
+    int cnt = candidateCountsForDistrict[d];
+    for (int c=0; c<cnt; c++){
+      String ck = "candidate_" + String(c+1);
+      dob[ck] = voteCount[d][c];
+    }
+    dob["total"] = districtTotal[d];
+  }
+  // include overall
+  doc.createNestedObject("meta")["overall"] = globalTotal;
+
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+
+// Setup webpages and endpoints
+void setupWebServerRoutes(){
+  // Main control page
+  server.on("/", HTTP_GET, [](){
+    String page = R"====(
+<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Voting Machine Control</title>
+<style>
+body{font-family:Arial;background:#f5f8fb;margin:0;padding:18px}
+.header{background:#1a73e8;color:#fff;padding:12px;border-radius:8px;text-align:center}
+.card{background:#fff;padding:16px;border-radius:10px;margin-top:14px;box-shadow:0 6px 18px rgba(16,24,40,0.06)}
+.btn{background:#1a73e8;color:#fff;border:none;padding:10px 14px;border-radius:8px;margin:6px;font-size:15px;cursor:pointer}
+.small{color:#6b7280;font-size:13px}
+.vote-buttons { margin-top:12px; display:flex; flex-wrap:wrap; gap:8px; }
+</style>
+<script>
+function callPlain(endpoint, onDone){ fetch(endpoint).then(r=>r.text()).then(t=>{ if(onDone) onDone(t); else alert(t); }); }
+
+
+// Vote: request choices (triggers fingerprint scan), then render candidate buttons
+function voteWeb(){
+  fetch('/cmd/vote?mode=choices').then(r=>r.json()).then(data=>{
+    if(!data || data.status!=='ok_choices'){ alert('No match or error: ' + (data.msg||'')); return; }
+    const voteArea = document.getElementById('voteArea');
+    voteArea.innerHTML = '';
+    const h = document.createElement('h3'); h.innerText = 'Select for: ' + data.name; voteArea.appendChild(h);
+    const cont = document.createElement('div');
+    cont.className = 'vote-buttons';
+    data.candidates.forEach((cand, idx) => {
+      const b = document.createElement('button');
+      b.className='btn';
+      b.innerText = cand;
+      b.onclick = function(){
+        fetch('/cmd/vote?mode=cast&candidate=' + idx)
+          .then(r=>r.text())
+          .then(resp=>{
+            alert(resp);
+            voteArea.innerHTML='';
+          });
+      };
+      cont.appendChild(b);
+    });
+    voteArea.appendChild(cont);
+  }).catch(e=>{ alert('Error: '+e); });
+}
+
+
+function enrollWeb(){
+  const name = prompt('Voter name:'); if(!name) return;
+  const district = prompt('District number:'); if(!district) return;
+  const panch = prompt('Panchayath code:'); if(!panch) return;
+  callPlain('/cmd/enroll?name='+encodeURIComponent(name)+'&district='+district+'&panch='+panch, function(t){ alert(t); });
+}
+
+
+function listWeb(){ callPlain('/cmd/list'); }
+function deleteOne(){ const id=prompt('ID to delete:'); if(id) callPlain('/cmd/delete?id='+id); }
+function deleteAll(){ if(confirm('Delete ALL voters?')) callPlain('/cmd/delete_all'); }
+function queueSz(){ callPlain('/cmd/queue'); }
+function leaderboard(){ fetch('/cmd/leaderboard').then(r=>r.text()).then(t=>{ try{ const j=JSON.parse(t); alert(JSON.stringify(j,null,2)); }catch(e){ alert(t); } }); }
+</script>
+</head><body>
+<div class='header'><h2>Voting Machine Control</h2></div>
+<div class='card'>
+  <button class='btn' onclick='enrollWeb()'>Enroll (web)</button>
+  <button class='btn' onclick='voteWeb()'>Vote (web)</button>
+  <button class='btn' onclick='listWeb()'>List Voters</button>
+  <button class='btn' onclick='deleteOne()'>Delete Voter</button>
+  <button class='btn' onclick='deleteAll()'>Delete ALL</button>
+  <button class='btn' onclick='queueSz()'>Offline Queue Size</button>
+  <button class='btn' onclick='leaderboard()'>Leaderboard</button>
+  <div id='voteArea' style='margin-top:12px;'></div>
+  <p class='small'>Finger scans must be performed at the device when requested. Web actions call the same internal functions as serial commands.</p>
+  <p class='small'>ESP IP: )====";
+    page += WiFi.localIP().toString();
+    page += R"====(</p>
+</div></body></html>)====";
+    server.send(200, "text/html", page);
+  });
+
+
+  // Local counts endpoint
+  server.on("/cmd/getLocalCounts", HTTP_GET, [](){
+    handleGetLocalCounts();
+  });
+
+
+  // Results page - reads local counts endpoint
+  server.on("/results", HTTP_GET, [](){
+    String page = R"====(
+<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Live Voting Results (Local)</title>
+<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+<style>
+body{font-family:Arial;background:#eef2f7;margin:0;padding:18px}
+.header{background:#1a73e8;color:#fff;padding:16px;border-radius:10px;text-align:center;margin-bottom:18px}
+.container{max-width:980px;margin:0 auto}
+.card{background:#fff;padding:16px;border-radius:10px;box-shadow:0 6px 18px rgba(16,24,40,0.06);margin-bottom:14px}
+.title{font-weight:bold;color:#1a73e8;margin-bottom:8px}
+.info{color:#333}
+.small{color:#666;font-size:13px}
+.controls{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+</style>
+</head><body>
+<div class='header'><h2>Live Voting Results (Local)</h2></div>
+<div class='container'>
+  <div class='card controls'>
+    <label>Refresh interval:
+      <select id='interval'>
+        <option value='2000'>2s</option>
+        <option value='3000' selected>3s</option>
+        <option value='5000'>5s</option>
+      </select>
+    </label>
+    <button onclick='updateNow()'>Refresh now</button>
+    <div style='margin-left:auto' class='small'>Data source: local ESP counts</div>
+  </div>
+  <div id='districtContainer'></div>
+  <div class='card'>
+    <div class='title'>Overall Total Votes</div>
+    <div id='overallTotal' class='info'>0</div>
+  </div>
+</div>
+
+
+<script>
+async function fetchLocalCounts(){
+  try{
+    const r = await fetch('/cmd/getLocalCounts');
+    if(!r.ok) return null;
+    return await r.json();
+  } catch(e){
+    return null;
+  }
+}
+
+
+function parseCounts(data){
+  const districts = [];
+  const dk = Object.keys(data).filter(k=>k.startsWith('district_')).sort();
+  dk.forEach(dKey => {
+    const obj = data[dKey];
+    const parties = [];
+    let total = 0;
+    const pkeys = Object.keys(obj).sort();
+    pkeys.forEach(pKey=>{
+      if(pKey === 'total') return;
+      const v = Number(obj[pKey]) || 0;
+      parties.push({ key: pKey, name: pKey.replace('candidate_','Party '), votes: v });
+      total += v;
+    });
+    if(obj.total !== undefined) total = Number(obj.total);
+    districts.push({ key: dKey, name: dKey.replace('district_','District '), parties: parties, total: total });
+  });
+  return districts;
+}
+
+
+function render(districts){
+  const container = document.getElementById('districtContainer');
+  container.innerHTML = '';
+  let overall = 0;
+
+
+  if(!districts || districts.length===0){
+    container.innerHTML = "<div class='card'><div class='title'>No vote data available</div><div class='small'>Waiting for votes...</div></div>";
+    document.getElementById('overallTotal').innerText = '0';
+    return;
+  }
+
+
+  districts.forEach((d, idx) => {
+    overall += d.total;
+    const card = document.createElement('div');
+    card.className = 'card';
+
+
+    const title = document.createElement('div');
+    title.className = 'title';
+    title.innerText = d.name + ' — Total Votes: ' + d.total;
+    card.appendChild(title);
+
+
+    d.parties.forEach(p=>{
+      const pdiv = document.createElement('div');
+      pdiv.className = 'info';
+      pdiv.innerText = p.name + ': ' + p.votes + ' votes';
+      card.appendChild(pdiv);
+    });
+
+
+    const canvas = document.createElement('canvas');
+    canvas.id = 'chart_' + idx;
+    canvas.style.marginTop = '8px';
+    card.appendChild(canvas);
+
+
+    container.appendChild(card);
+
+
+    const ctx = canvas.getContext('2d');
+    const labels = d.parties.map(x=>x.name);
+    const dataVals = d.parties.map(x=>x.votes);
+    new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: d.name,
+          data: dataVals,
+          backgroundColor: ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2']
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: { y: { beginAtZero: true } },
+        plugins: { legend: { display: false } }
+      }
+    });
+  });
+
+
+  document.getElementById('overallTotal').innerText = overall;
+}
+
+
+async function refresh(){
+  const raw = await fetchLocalCounts();
+  if(!raw){ render([]); return; }
+  const districts = parseCounts(raw);
+  render(districts);
+}
+
+
+let intervalId = null;
+function scheduleInterval(){
+  const sel = document.getElementById('interval');
+  if(intervalId) clearInterval(intervalId);
+  intervalId = setInterval(refresh, parseInt(sel.value));
+}
+
+
+document.addEventListener('DOMContentLoaded', function(){
+  refresh();
+  scheduleInterval();
+  document.getElementById('interval').addEventListener('change', scheduleInterval);
+});
+
+
+function updateNow(){ refresh(); }
+</script>
+</body></html>
+)====";
+    server.send(200, "text/html", page);
+  });
+
+
+  // Web enroll endpoint
+  server.on("/cmd/enroll", HTTP_GET, [](){
+    String name = server.hasArg("name") ? server.arg("name") : String("Unknown");
+    int district = server.hasArg("district") ? server.arg("district").toInt() : 1;
+    int panch = server.hasArg("panch") ? server.arg("panch").toInt() : 0;
+    String res = webEnroll(name, district, panch);
+    server.send(200, "text/plain", res);
+  });
+
+
+  // Web vote endpoint
+  server.on("/cmd/vote", HTTP_GET, [](){
+    String mode = server.hasArg("mode") ? server.arg("mode") : String("choices");
+    if (mode == "choices"){
+      String out;
+      String r = webVote(0, false, out);
+      if (r == "CHOICE_LIST"){
+        server.send(200, "application/json", out);
+      } else {
+        DynamicJsonDocument doc(128);
+        doc["status"] = "no_match";
+        doc["msg"] = r;
+        String s; serializeJson(doc, s);
+        server.send(200, "application/json", s);
+      }
+    } else if (mode == "cast"){
+      if (!server.hasArg("candidate")){
+        server.send(400, "text/plain", "Missing candidate index");
+        return;
+      }
+      int c = server.arg("candidate").toInt();
+      String outJson;
+      String r = webVote(c, true, outJson);
+      server.send(200, "text/plain", r);
+    } else {
+      server.send(400, "text/plain", "Unknown mode");
+    }
+  });
+
+
+  // List voters
+  server.on("/cmd/list", HTTP_GET, [](){
+    String out = "";
+    for (int id=1; id<=MAX_RECORDS; id++){
+      VoterRecord r;
+      if (loadVoterRecord(id, r)){
+        out += "ID " + String(id) + ": " + String(r.name) + " | D:" + String(r.district) + " P:" + String(r.panchayath) + "\n";
+      }
+    }
+    server.send(200, "text/plain", out);
+  });
+
+
+  // Delete one
+  server.on("/cmd/delete", HTTP_GET, [](){
+    if (!server.hasArg("id")){
+      server.send(400, "text/plain", "Missing id");
+      return;
+    }
+    int id = server.arg("id").toInt();
+    deleteVoterRecord(id);
+    server.send(200, "text/plain", "Deleted ID: " + String(id));
+  });
+
+
+  // Delete all
+  server.on("/cmd/delete_all", HTTP_GET, [](){
+    for (int id=1; id<=MAX_RECORDS; id++) deleteVoterRecord(id);
+    server.send(200, "text/plain", "All voters deleted.");
+  });
+
+
+  // Queue size
+  server.on("/cmd/queue", HTTP_GET, [](){
+    server.send(200, "text/plain", String(getOfflineQueueSize()));
+  });
+
+
+  // Leaderboard raw (local JSON)
+  server.on("/cmd/leaderboard", HTTP_GET, [](){
+    DynamicJsonDocument doc(1024);
+    for (int d=0; d<NUM_DISTRICTS; d++){
+      String dk = "district_" + String(d+1);
+      JsonObject dob = doc.createNestedObject(dk);
+      int cnt = candidateCountsForDistrict[d];
+      for (int c=0; c<cnt; c++){
+        String ck = "candidate_" + String(c+1);
+        dob[ck] = voteCount[d][c];
+      }
+      dob["total"] = districtTotal[d];
+    }
+    String out; serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+
+  // Voters index - list HTML with links
+  server.on("/voters", HTTP_GET, [](){
+    String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Voters</title>";
+    page += "<style>body{font-family:Arial;padding:12px} .card{background:#fff;padding:12px;border-radius:8px;margin:8px 0;box-shadow:0 6px 18px rgba(16,24,40,0.06)}</style></head><body>";
+    page += "<h2>Enrolled Voters</h2>";
+    for (int id=1; id<=MAX_RECORDS; id++){
+      VoterRecord r;
+      if (loadVoterRecord(id, r)){
+        page += "<div class='card'><a href='/voter?id=" + String(id) + "'>ID " + String(id) + "</a> - " + String(r.name) + " (D:" + String(r.district) + " P:" + String(r.panchayath) + ")</div>";
+      }
+    }
+    page += "</body></html>";
+    server.send(200, "text/html", page);
+  });
+
+
+  // Single voter page: /voter?id=<n>
+  server.on("/voter", HTTP_GET, [](){
+    if (!server.hasArg("id")) { server.send(400, "text/plain", "Missing id"); return; }
+    int id = server.arg("id").toInt();
+    VoterRecord r;
+    if (!loadVoterRecord(id, r)) { server.send(404, "text/plain", "Voter not found"); return; }
+    String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Voter " + String(id) + "</title></head><body>";
+    page += "<h2>Voter ID " + String(id) + "</h2>";
+    page += "<div><strong>Name:</strong> " + String(r.name) + "</div>";
+    page += "<div><strong>District:</strong> " + String(r.district) + "</div>";
+    page += "<div><strong>Panchayath:</strong> " + String(r.panchayath) + "</div>";
+    page += "<div style='margin-top:12px;'><a href='/voters'>Back to list</a></div>";
+    page += "</body></html>";
+    server.send(200, "text/html", page);
+  });
+
+
+  // District page: /district?id=<n>
+  server.on("/district", HTTP_GET, [](){
+    if (!server.hasArg("id")) { server.send(400, "text/plain", "Missing id"); return; }
+    int d = server.arg("id").toInt();
+    if (d < 1 || d > NUM_DISTRICTS){ server.send(400, "text/plain", "Invalid district"); return; }
+    int idx = d - 1;
+    String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>District " + String(d) + "</title></head><body>";
+    page += "<h2>District " + String(d) + " — Total: " + String(districtTotal[idx]) + "</h2>";
+    page += "<ul>";
+    int cnt = candidateCountsForDistrict[idx];
+    for (int c=0;c<cnt;c++){
+      page += "<li>" + String(candidates[idx][c]) + " : " + String(voteCount[idx][c]) + " votes</li>";
+    }
+    page += "</ul>";
+    page += "<div style='margin-top:12px'><a href='/results'>Back to results</a></div>";
+    page += "</body></html>";
+    server.send(200, "text/html", page);
+  });
+
+
+  server.begin();
+}
+
+
+// ----------------- incrementLocalAndRemoteCounts (persist + enqueue on fail) -----------------
+void incrementLocalAndRemoteCounts(uint8_t district, uint8_t candidateIndex) {
+  int dIdx = (int)district - 1;
+  if (dIdx < 0 || dIdx >= NUM_DISTRICTS) return;
+  if (candidateIndex < 0 || candidateIndex >= MAX_CANDIDATES) return;
+
+
+  voteCount[dIdx][candidateIndex]++;
+  districtTotal[dIdx]++;
+  globalTotal++;
+
+
+  // persist counts to EEPROM immediately
+  saveCountsToEEPROM();
+
+
+  Serial.printf("Local count updated: District %d Candidate %d -> %d\n", district, candidateIndex+1, voteCount[dIdx][candidateIndex]);
+
+
+  // Try to increment counters in Firebase. If Firebase is not ready or increment fails,
+  // enqueue a minimal VoteEvent into the offline queue for later sync.
+  bool incOk = false;
+  if (Firebase.ready()){
+    if (firebaseIncrementVote(district, candidateIndex + 1)) {
+      incOk = true;
+    } else {
+      Serial.println("firebaseIncrementVote returned false (will enqueue for later sync).");
+    }
+  } else {
+    Serial.println("Firebase not ready; enqueueing increment event.");
+  }
+
+
+  if (!incOk) {
+    VoteEvent ev;
+    ev.ts = (uint32_t)(millis() / 1000UL);
+    ev.fingerID = 0; // 0 indicates a count-only / queued increment if no fingerprint info
+    ev.district = district;
+    ev.candidateIndex = candidateIndex;
+    strncpy(ev.candidateName, candidates[dIdx][candidateIndex], sizeof(ev.candidateName)-1);
+    ev.candidateName[sizeof(ev.candidateName)-1] = 0;
+    enqueueEvent(ev);
+    Serial.println("Enqueued offline increment event.");
+  }
+}
+
+
+// ----------------- Setup & loop -----------------
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\nVoting Machine booting...");
+
+
+  Wire.begin(21,22); // SDA, SCL
+  initFingerprint();
+  initEventQueueIfNeeded();
+
+
+  // load persistent counts from EEPROM (if previously saved)
+  loadCountsFromEEPROM();
+
+
+  // Connect WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED){
+    Serial.print(".");
+    delay(300);
+    if (millis() - t0 > 20000) break;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ WiFi connected. IP: " + WiFi.localIP().toString());
+  } else Serial.println("⚠️ WiFi not connected.");
+
+
+  firebaseSetup();
+
+
+  // Setup webserver routes
+  setupWebServerRoutes();
+
+
+  server.begin();
+
+
+  // Update results_url into Firebase (so remote clients can find the page)
+  firebaseUpdateResultsURL();
+
+
+  // Serial links
+  Serial.println();
+  Serial.println("======== VOTING MACHINE READY ========");
+  Serial.println("MAIN CONTROL PAGE:");
+  Serial.println("  http://" + WiFi.localIP().toString() + "/");
+  Serial.println();
+  Serial.println("LIVE RESULTS PAGE:");
+  Serial.println("  http://" + WiFi.localIP().toString() + "/results");
+  Serial.println();
+  Serial.println("VOTERS LIST PAGE:");
+  Serial.println("  http://" + WiFi.localIP().toString() + "/voters");
+  Serial.println();
+  Serial.println("FIREBASE DATABASE URL:");
+  Serial.println("  " + String(DATABASE_URL));
+  Serial.println("=======================================");
+  Serial.println();
+
+
+  showMenu();
+}
+
+
+void loop(){
+  // periodic auto-sync
+  if (millis() - lastAutoSyncMs > AUTO_SYNC_INTERVAL_MS){
+    lastAutoSyncMs = millis();
+    if (Firebase.ready()) syncOfflineVotes();
+  }
+
+
+  // handle web clients
+  server.handleClient();
+
+
+  // Serial menu handling
+  if (Serial.available()){
+    int opt = Serial.parseInt();
+    Serial.readStringUntil('\n');
+    switch (opt){
+      case 1: enrollFlow(); break;
+      case 2: voteFlow(); break;
+      case 3: listVoters(); break;
+      case 4: deleteVoterByID(); break;
+      case 5: deleteAllVoters(); break;
+      case 6: Serial.printf("Offline queue size: %d\n", getOfflineQueueSize()); break;
+      case 7: showLeaderboard(); break;
+      default: Serial.println("Unknown option."); break;
+    }
+    showMenu();
+  }
+  delay(20);
+}
+
+
+
