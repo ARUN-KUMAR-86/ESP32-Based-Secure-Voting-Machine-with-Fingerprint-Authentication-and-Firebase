@@ -1,0 +1,2 @@
+# ESP32-Based-Secure-Voting-Machine-with-Fingerprint-Authentication-and-Firebase
+A secure ESP32-based electronic voting machine using fingerprint authentication for voter verification. The system supports offline vote storage with EEPROM, real-time Firebase synchronization, web-based voter management, live result dashboards, and district-wise vote counting, ensuring reliability, transparency, and fault-tolerant operation.
